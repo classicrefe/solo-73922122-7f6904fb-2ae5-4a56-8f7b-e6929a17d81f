@@ -88,14 +88,30 @@ def create_app(db_path: Optional[str] = None) -> Flask:
             label_cut = int(payload.get("label_cut"))
         except (TypeError, ValueError):
             return fail("换标瓶号必须是整数。")
+        req_id = str(payload.get("req_id") or "")
         store = _store(app)
         try:
             info = store.set_label_cut(label_cut)
         except StoreError as exc:
             return fail(str(exc))
         except Exception as exc:
-            return fail(f"写入失败，沿用原结果：{exc}", 500)
-        return jsonify({"ok": True, "label": info, "summary": store.summary()})
+            # The transaction rolled back: include the still-committed view so
+            # the page can keep showing exactly what SQLite holds.
+            return fail(
+                f"写入失败，沿用原结果：{exc}",
+                500,
+                {"summary": store.summary(), "applied": False, "req_id": req_id},
+            )
+        return jsonify({
+            "ok": True,
+            "label": info,
+            "update": info,
+            "summary": info["after"],
+            "before": info["before"],
+            "after": info["after"],
+            "epoch": info["epoch"],
+            "req_id": req_id,
+        })
 
     @app.post("/api/sample")
     def set_sample():
@@ -105,6 +121,7 @@ def create_app(db_path: Optional[str] = None) -> Flask:
         except (TypeError, ValueError):
             return fail("瓶号必须是整数。")
         verdict = str(payload.get("verdict", "")).strip()
+        req_id = str(payload.get("req_id") or "")
         store = _store(app)
         try:
             info = store.set_verdict(bottle, verdict)
@@ -115,11 +132,18 @@ def create_app(db_path: Optional[str] = None) -> Flask:
             return fail(
                 f"写入失败，沿用原结果：{exc}",
                 500,
-                {"summary": committed, "applied": False},
+                {"summary": committed, "applied": False, "req_id": req_id,
+                 "epoch": committed.get("epoch")},
             )
-        return jsonify(
-            {"ok": True, "update": info, "summary": store.summary()}
-        )
+        return jsonify({
+            "ok": True,
+            "update": info,
+            "summary": info["after"],
+            "before": info["before"],
+            "after": info["after"],
+            "epoch": info["epoch"],
+            "req_id": req_id,
+        })
 
     @app.post("/api/demo")
     def load_demo():

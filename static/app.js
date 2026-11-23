@@ -1,13 +1,28 @@
 "use strict";
+/*
+ * Page controller.  All reconciliation/diff rules live in diff.js so they can
+ * be unit-tested headlessly; this file only wires them to the DOM.
+ *
+ * Concurrency rules implemented here:
+ *   - submit buttons stay enabled while a receipt is outstanding, so a second
+ *     window's worth of work (or a second write from this page) can proceed;
+ *   - every write is registered with a local order and a req_id; the server
+ *     echoes the req_id and returns the write's own adjacent before/after
+ *     reports, so a comparison never contains another write's changes;
+ *     - the diff panel shows the highest-order write whose success receipt has
+ *       arrived (a late receipt of an earlier write cannot replace a newer
+ *       one);
+ *     - the main report follows actual commit order for the current shift;
+ *     - a receipt for a shift the page has since reset/re-imported still
+ *       renders its own diff, marked as an old shift, but never touches the
+ *       current report.
+ */
 
-const state = {
-  summary: null,
-  lastGood: null,   // last successfully applied summary (write-failure fallback)
-  demo: null,
-};
+const D = window.RelabelDiff;
+const state = D.createWriteState();
 
 const $ = (id) => document.getElementById(id);
-const fmt = (n) => (n === null || n === undefined ? "–" : n.toLocaleString("zh-CN"));
+const fmt = D.fmtNum;
 
 function toast(message, isError) {
   const el = $("toast");
@@ -15,7 +30,7 @@ function toast(message, isError) {
   el.classList.toggle("err", !!isError);
   el.hidden = false;
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.hidden = true; }, 3200);
+  toast._t = setTimeout(() => { el.hidden = true; }, 3600);
 }
 
 function showError(id, message) {
@@ -38,11 +53,16 @@ async function api(path, options) {
   return payload;
 }
 
-function segText(seg) {
-  if (!seg) return null;
-  return `#${fmt(seg.start)} – #${fmt(seg.end)}`;
+function applyReport(summary) {
+  if (!summary) return;
+  state.report = summary;
+  state.currentEpoch = (summary.state && summary.state.epoch) || state.currentEpoch;
+  renderStat(summary);
 }
 
+// ---------------------------------------------------------------------------
+// Reconciliation report rendering
+// ---------------------------------------------------------------------------
 function renderStat(summary) {
   if (!summary || !summary.initialized) {
     $("report-card").hidden = true;
@@ -114,7 +134,7 @@ function renderList(id, seg, emptyText) {
   const host = $(id);
   if (!seg) { host.innerHTML = `<div class="seg-empty">${emptyText}</div>`; return; }
   host.innerHTML =
-    `<div class="seg-row"><span>瓶号 <span class="num">${segText(seg)}</span></span>` +
+    `<div class="seg-row"><span>瓶号 <span class="num">${D.segText(seg)}</span></span>` +
     `<span class="cnt">${fmt(seg.count)} 瓶</span></div>`;
 }
 
@@ -160,57 +180,62 @@ function renderOps(summary) {
   const s = summary.state;
   host.innerHTML =
     `<div><dt>已提交版本</dt><dd>v${fmt(summary.version)}</dd></div>` +
+    `<div><dt>班次纪元</dt><dd><code>${(s.epoch || "").slice(0, 12) || "–"}</code></dd></div>` +
+    `<div><dt>在途补改</dt><dd>${fmt(state.pending.size)}</dd></div>` +
     `<div><dt>最近写入</dt><dd>${s.updated_at || "–"}</dd></div>` +
     `<div><dt>查询读取树节点</dt><dd>${fmt(summary.query_nodes)}</dd></div>` +
     `<div><dt>候选切点查询</dt><dd>O(log N)</dd></div>` +
     `<div><dt>单瓶补改</dt><dd>O(log N)</dd></div>`;
 }
 
-function applySummary(summary) {
-  state.summary = summary;
-  state.lastGood = summary;
-  renderStat(summary);
-}
+// ---------------------------------------------------------------------------
+// Before/after comparison panel
+// ---------------------------------------------------------------------------
+function renderDiff(record) {
+  if (!record) { $("diff").hidden = true; return; }
+  const rowsBefore = D.diffRows(record.before);
+  const rowsAfter = D.diffRows(record.after);
+  const changed = D.changedRowIndexes(record.before, record.after);
+  const firstLabel = D.isFirstLabelEntry(record.before, record.after);
 
-function diffRows(summary) {
-  if (!summary || !summary.initialized || summary.label_missing) {
-    return [
-      ["换标号", "未录入"],
-      ["必错号段", "–"],
-      ["仅部分切点错标", "–"],
-      ["错标瓶数上下界", "–"],
-    ];
-  }
-  return [
-    ["换标号", "#" + fmt(summary.label_cut)],
-    ["必错号段", summary.must ? segText(summary.must) + `（${fmt(summary.must.count)} 瓶）` : "无"],
-    ["仅部分切点错标", summary.partial ? segText(summary.partial) + `（${fmt(summary.partial.count)} 瓶）` : "无"],
-    ["错标瓶数上下界", `${fmt(summary.bounds.min)} – ${fmt(summary.bounds.max)} 瓶`],
-    ["候选切点", `#${fmt(summary.candidates.first)} – #${fmt(summary.candidates.last)}（${fmt(summary.candidates.count)} 个）`],
-  ];
-}
+  const html = (rows) => rows.map(([k, v]) =>
+    `<div class="diff-row"><span>${k}</span><b>${v}</b></div>`).join("");
+  $("diff-before").innerHTML = firstLabel
+    ? `<div class="diff-note">首次补录换标号：本笔之前换标号${D.EMPTY}，尚无重贴核对。</div>` + html(rowsBefore)
+    : html(rowsBefore);
+  $("diff-after").innerHTML = rowsAfter.map(([k, v], i) =>
+    `<div class="diff-row"><span>${k}</span><b class="${changed.has(i) ? "changed" : ""}">${v}</b></div>`
+  ).join("");
 
-function renderDiff(before, after) {
-  const rowsBefore = diffRows(before);
-  const rowsAfter = diffRows(after);
-  const html = (rows) => rows.map(([k, v]) => `<div class="diff-row"><span>${k}</span><b>${v}</b></div>`).join("");
-  $("diff-before").innerHTML = html(rowsBefore);
-  $("diff-after").innerHTML = rowsAfter.map(([k, v], i) => {
-    const changed = v !== rowsBefore[i][1] ? " changed" : "";
-    return `<div class="diff-row"><span>${k}</span><b class="${changed}">${v}</b></div>`;
-  }).join("");
+  $("diff-title").textContent = "补改前后对比 · " + D.describeWrite(record);
+  const badge = $("diff-badge");
+  const stale = D.isStaleEpoch(record.epoch, state.currentEpoch);
+  badge.hidden = !stale;
+  badge.textContent = stale
+    ? `旧班次回执（纪元 ${(record.epoch || "").slice(0, 12)}），仅展示本笔差异，当前核对不受影响`
+    : "";
   $("diff").hidden = false;
 }
 
-// Keep the last successfully committed snapshot untouched when a write was
-// rejected: the page must keep showing the same state as SQLite.
+function refreshDiff() {
+  renderDiff(D.latestRecord(state));
+}
+
+// Write failures keep the last committed report; the server re-reads SQLite
+// and sends that snapshot back in the error payload.
 function reportWriteFailure(error) {
   showError("edit-error", error.message);
-  if (error.payload && error.payload.summary) {
-    state.summary = error.payload.summary;      // server re-read committed state
-    renderStat(state.lastGood);
-  } else if (state.lastGood) {
-    renderStat(state.lastGood);
+  const decision = D.handleFailure(state, error.payload, state.currentEpoch);
+  if (decision.report) applyReport(decision.report);
+  else if (state.report) renderStat(state.report);
+  if (decision.staleEpoch) {
+    toast("该回执属于已清空重导的旧班次，当前核对保持新班次。", true);
+  }
+}
+
+function inflightNote() {
+  if (state.pending.size > 0) {
+    toast(`已有 ${state.pending.size} 笔补改在途，仍可继续提交。`);
   }
 }
 
@@ -220,7 +245,9 @@ function reportWriteFailure(error) {
 async function refresh() {
   try {
     const { summary } = await api("/api/summary");
-    applySummary(summary);
+    D.beginEpoch(state, summary);
+    renderStat(summary);
+    refreshDiff();
   } catch (error) {
     toast(error.message, true);
   }
@@ -239,13 +266,13 @@ $("import-form").addEventListener("submit", async (event) => {
   body.append("label_cut", label);
   const button = $("import-btn");
   button.disabled = true;
-  const before = state.summary;
   try {
     const payload = await api("/api/import", { method: "POST", body });
-    applySummary(payload.summary);
-    toast(`已导入 ${payload.import.rows} 条留样，已提交 v${payload.import.version}`);
-    if (before && before.initialized) renderDiff(before, payload.summary);
-    else $("diff").hidden = true;
+    // A (re-)import starts a fresh shift; prior comparisons are retired.
+    D.beginEpoch(state, payload.summary);
+    renderStat(payload.summary);
+    $("diff").hidden = true;
+    toast(`已导入 ${payload.import.rows} 条留样，已提交 v${payload.import.version}（新班次）`);
   } catch (error) {
     showError("import-error", error.message);
   } finally {
@@ -261,20 +288,25 @@ $("apply-verdict").addEventListener("click", async () => {
     showError("edit-error", "请输入有效的瓶号。");
     return;
   }
-  const before = state.summary;
+  const reqId = D.registerWrite(state, { kind: "sample", bottle, verdict });
+  inflightNote();
   try {
     const payload = await api("/api/sample", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bottle, verdict }),
+      body: JSON.stringify({ bottle, verdict, req_id: reqId }),
     });
-    applySummary(payload.summary);
+    const decision = D.acceptReceipt(state, payload, "sample", state.currentEpoch);
+    if (decision.report) applyReport(decision.report);
+    else if (state.report) renderStat(state.report);
+    if (decision.showDiff) renderDiff(decision.record);
     const u = payload.update;
     $("edit-hint").textContent = u.changed
-      ? `#${bottle}：${u.previous || "无记录"} → ${verdict}；增量更新 ${u.update_nodes} 个树节点，报告已按 v${u.version} 重算。`
+      ? `#${bottle}：${u.previous || "无记录"} → ${verdict}；增量更新 ${u.update_nodes} 个树节点，本笔前后核对已按 v${u.version} 配对。`
       : `#${bottle} 原本就是 ${verdict}，未改动。`;
-    renderDiff(before, payload.summary);
-    toast("补改已提交");
+    toast(decision.staleEpoch
+      ? "收到旧班次补判回执：差异已按旧班次单独标出，当前核对保持新班次。"
+      : "补判已提交，对比仅含本笔变化。");
   } catch (error) {
     reportWriteFailure(error);
   }
@@ -287,29 +319,35 @@ $("apply-label").addEventListener("click", async () => {
     showError("edit-error", "请输入有效的换标号（≥ 0）。");
     return;
   }
-  const before = state.summary;
+  const reqId = D.registerWrite(state, { kind: "label", label_cut: label });
+  inflightNote();
   try {
     const payload = await api("/api/label", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label_cut: label }),
+      body: JSON.stringify({ label_cut: label, req_id: reqId }),
     });
-    applySummary(payload.summary);
-    renderDiff(before, payload.summary);
-    toast("换标号已更正");
+    const decision = D.acceptReceipt(state, payload, "label", state.currentEpoch);
+    if (decision.report) applyReport(decision.report);
+    else if (state.report) renderStat(state.report);
+    if (decision.showDiff) renderDiff(decision.record);
+    toast(decision.staleEpoch
+      ? "收到旧班次换标号回执：差异已按旧班次单独标出，当前核对保持新班次。"
+      : "换标号更正已提交，对比仅含本笔变化。");
   } catch (error) {
     reportWriteFailure(error);
   }
 });
 
 $("reset-btn").addEventListener("click", async () => {
-  if (!confirm("确定清空全部留样与换标号？")) return;
+  if (!confirm("确定清空全部留样与换标号？在途补改的迟到回执将按旧班次单独标注。")) return;
   try {
     const payload = await api("/api/reset", { method: "POST" });
-    applySummary(payload.summary);
+    D.beginEpoch(state, payload.summary);
+    renderStat(payload.summary);
     $("diff").hidden = true;
     $("edit-hint").textContent = "补改只改动一个留样，并增量更新冲突函数；报告随最新已提交状态重算。";
-    toast("已清空");
+    toast("已清空，开始新班次；旧班次迟到回执不会覆盖当前核对。");
   } catch (error) {
     toast(error.message, true);
   }
@@ -322,12 +360,13 @@ $("demo-btn").addEventListener("click", async () => {
   button.disabled = true;
   try {
     const payload = await api("/api/demo", { method: "POST" });
-    applySummary(payload.summary);
+    D.beginEpoch(state, payload.summary);
+    renderStat(payload.summary);
     $("diff").hidden = true;
     $("edit-bottle").value = "58800";
     $("edit-verdict").value = "old";
     $("edit-label").value = String(payload.summary.label_cut ?? "");
-    toast("演示数据已载入：100000 瓶，#58800 为待核留样，可补改对比。");
+    toast("演示数据已载入：100000 瓶，#58800 为待核留样，可连续提交多笔补改对比。");
   } catch (error) {
     toast(error.message, true);
   } finally {

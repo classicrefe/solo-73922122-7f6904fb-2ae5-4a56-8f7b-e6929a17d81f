@@ -126,10 +126,13 @@
         <button class="primary" id="apply-label">更正换标号</button>
       </div>
     </div>
-    <p class="hint" id="edit-hint">补改只改动一个留样，并增量更新冲突函数；报告随最新已提交状态重算。</p>
+    <p class="hint" id="edit-hint">补改只改动一个留样，并增量更新冲突函数；报告随最新已提交状态重算。等待回执期间仍可继续提交补改，每笔对比只含该笔自身的前后变化。</p>
     <p class="error" id="edit-error" hidden></p>
     <div class="diff" id="diff" hidden>
-      <h3>补改前后对比</h3>
+      <div class="diff-head">
+        <h3 id="diff-title">补改前后对比</h3>
+        <span class="stale-badge" id="diff-badge" hidden></span>
+      </div>
       <div class="diff-grid">
         <div class="diff-col"><h4>补改前</h4><div id="diff-before"></div></div>
         <div class="diff-arrow">→</div>
@@ -145,6 +148,7 @@
 </main>
 
 <div class="toast" id="toast" hidden></div>
+<script src="{{ url_for('static', filename='diff.js') }}"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

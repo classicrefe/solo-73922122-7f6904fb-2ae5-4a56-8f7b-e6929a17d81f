@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -52,6 +53,7 @@ DEFAULT_META = {
     "label_cut": "",
     "seg_size": "0",
     "version": "0",
+    "epoch": "",
     "samples_old": "0",
     "samples_new": "0",
     "samples_pending": "0",
@@ -61,6 +63,11 @@ DEFAULT_META = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_epoch() -> str:
+    """Identify one imported shift; reset/import/demo all mint a new epoch."""
+    return uuid.uuid4().hex
 
 
 def tree_size(n_bottles: int) -> int:
@@ -359,37 +366,47 @@ class Store:
             "samples_new": int(meta["samples_new"]),
             "samples_pending": int(meta["samples_pending"]),
             "updated_at": meta["updated_at"],
+            "epoch": meta.get("epoch", ""),
         }
 
     # -- reads ------------------------------------------------------------
+    def _snapshot(self, cur) -> Dict:
+        """Build a full report from the caller's transaction snapshot.
+
+        Reads only ``meta`` plus O(log N) segment-tree nodes, so it stays
+        sub-linear even when called twice inside one write transaction.
+        """
+        meta = self._meta(cur)
+        n = int(meta["total_bottles"])
+        version = int(meta["version"])
+        state = self._state(meta)
+        epoch = meta.get("epoch", "")
+        base = {"state": state, "version": version, "epoch": epoch}
+        if n <= 0 or int(meta["seg_size"]) == 0:
+            return {"initialized": False, **base}
+        size = int(meta["seg_size"])
+        if not meta.get("label_cut"):
+            return {
+                "initialized": True,
+                "label_missing": True,
+                "query_nodes": 0,
+                **base,
+            }
+        label_cut = int(meta["label_cut"])
+        view = TreeView(cur, n, size)
+        result = algorithm.summarize(view, n, label_cut)
+        return {
+            "initialized": True,
+            "label_missing": False,
+            "query_nodes": view.visits,
+            **result,
+            **base,
+        }
+
     def summary(self) -> Dict:
         """Consistent report from one committed snapshot.  O(log N)."""
         with self.lock, self._tx(write=False) as cur:
-            meta = self._meta(cur)
-            n = int(meta["total_bottles"])
-            version = int(meta["version"])
-            state = self._state(meta)
-            base = {"state": state, "version": version}
-            if n <= 0 or int(meta["seg_size"]) == 0:
-                return {"initialized": False, **base}
-            size = int(meta["seg_size"])
-            if not meta.get("label_cut"):
-                return {
-                    "initialized": True,
-                    "label_missing": True,
-                    "query_nodes": 0,
-                    **base,
-                }
-            label_cut = int(meta["label_cut"])
-            view = TreeView(cur, n, size)
-            result = algorithm.summarize(view, n, label_cut)
-            return {
-                "initialized": True,
-                "label_missing": False,
-                "query_nodes": view.visits,
-                **result,
-                **base,
-            }
+            return self._snapshot(cur)
 
     def get_sample(self, bottle: int) -> Optional[Dict]:
         with self.lock:
@@ -437,6 +454,7 @@ class Store:
             verdicts = {bottle: verdict for bottle, verdict, _ in cleaned}
             size = rebuild_tree(cur, total_bottles, verdicts)
             version = int(old_meta["version"]) + 1
+            epoch = _new_epoch()
             if label_cut is None:
                 old_label = old_meta.get("label_cut") or ""
                 if old_label and not (0 <= int(old_label) <= total_bottles):
@@ -446,6 +464,7 @@ class Store:
                 "total_bottles": total_bottles,
                 "seg_size": size,
                 "version": version,
+                "epoch": epoch,
                 "samples_old": counts["old"],
                 "samples_new": counts["new"],
                 "samples_pending": counts["pending"],
@@ -458,6 +477,7 @@ class Store:
                 "counts": counts,
                 "total_bottles": total_bottles,
                 "version": version,
+                "epoch": epoch,
             }
 
     def set_label_cut(self, label_cut: int) -> Dict:
@@ -468,13 +488,29 @@ class Store:
                 raise StoreError("尚未导入留样，无法设置换标瓶号。")
             if not (0 <= label_cut <= n):
                 raise StoreError(f"换标瓶号必须在 0 到 {n} 之间。")
+            before = self._snapshot(cur)
+            previous = meta.get("label_cut") or ""
             version = int(meta["version"]) + 1
             self._set_meta(cur, label_cut=label_cut, version=version,
                            updated_at=_now())
-            return {"version": version, "label_cut": label_cut}
+            after = self._snapshot(cur)
+            return {
+                "version": version,
+                "label_cut": label_cut,
+                "changed": previous != str(label_cut),
+                "before": before,
+                "after": after,
+                "epoch": after["epoch"],
+            }
 
     def set_verdict(self, bottle: int, verdict: str) -> Dict:
-        """Change one retained sample's verdict in O(log N)."""
+        """Change one retained sample's verdict in O(log N).
+
+        The returned ``before``/``after`` snapshots are taken inside the same
+        write transaction, so they are always the two immediately adjacent
+        committed reconciliation states for this exact edit -- another window's
+        write can never appear inside this comparison.
+        """
         if verdict not in VERDICTS:
             raise StoreError(f"未知留样判定：{verdict!r}")
         with self.lock, self._tx(write=True) as cur:
@@ -489,6 +525,7 @@ class Store:
                 "SELECT verdict FROM samples WHERE bottle = ?", (bottle,)
             ).fetchone()
             previous = row[0] if row else None
+            before = self._snapshot(cur)
             if previous == verdict:
                 return {
                     "changed": False,
@@ -496,6 +533,9 @@ class Store:
                     "verdict": verdict,
                     "version": int(meta["version"]),
                     "update_nodes": 0,
+                    "before": before,
+                    "after": before,
+                    "epoch": before["epoch"],
                 }
             visited = 0
             if previous is not None:
@@ -516,12 +556,16 @@ class Store:
             counts["samples_" + verdict] += 1
             version = int(meta["version"]) + 1
             self._set_meta(cur, version=version, updated_at=_now(), **counts)
+            after = self._snapshot(cur)
             return {
                 "changed": True,
                 "previous": previous,
                 "verdict": verdict,
                 "version": version,
                 "update_nodes": visited,
+                "before": before,
+                "after": after,
+                "epoch": after["epoch"],
             }
 
     def reset(self) -> None:
@@ -530,7 +574,9 @@ class Store:
             cur.execute("DELETE FROM seg")
             for key, value in DEFAULT_META.items():
                 self._set_meta(cur, **{key: value})
-            self._set_meta(cur, total_bottles=0)
+            # A cleared board is a new epoch: late receipts of the old shift
+            # can be recognised and must never overwrite the new view.
+            self._set_meta(cur, total_bottles=0, epoch=_new_epoch())
 
     def close(self):
         with self.lock:

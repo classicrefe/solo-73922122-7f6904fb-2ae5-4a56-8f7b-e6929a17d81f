@@ -127,6 +127,16 @@ code { background: #f1ece3; padding: 1px 5px; border-radius: 5px; font-size: 12p
 #cand-line { font-variant-numeric: tabular-nums; color: var(--muted); }
 
 .diff { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px; }
+.diff-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.diff-head h3 { margin: 0; }
+.stale-badge {
+  font-size: 12px; color: var(--partial); background: var(--partial-bg);
+  border: 1px solid #e6d3a6; border-radius: 999px; padding: 3px 10px;
+}
+.diff-note {
+  font-size: 12px; color: var(--accent); background: #eef5f3;
+  border: 1px solid #cfe2dd; border-radius: 7px; padding: 6px 8px; margin-bottom: 8px;
+}
 .diff-grid { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: start; }
 .diff-col { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font-size: 13px; }
 .diff-arrow { align-self: center; color: var(--muted); font-size: 20px; }

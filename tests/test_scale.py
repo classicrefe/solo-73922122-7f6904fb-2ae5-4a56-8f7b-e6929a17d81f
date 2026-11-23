@@ -51,10 +51,15 @@ def measure(n):
     update_time = time.perf_counter() - started
     update_statements = counter["statements"]
 
+    # The write now also materialises its own adjacent before/after reports
+    # inside the transaction; each reads only O(log N) tree nodes.
+    assert info["before"]["query_nodes"] < 400
+    assert info["after"]["query_nodes"] < 400
+
     counter["statements"] = 0
     started = time.perf_counter()
     store.summary()
-    query_after_update = time.perf_counter() - started
+    query_after_ms = (time.perf_counter() - started) * 1000
 
     store.conn.set_trace_callback(None)
     store.close()
@@ -66,7 +71,7 @@ def measure(n):
         "update_nodes": info["update_nodes"],
         "query_ms": query_time * 1000,
         "update_ms": update_time * 1000,
-        "query_after_ms": query_after_update * 1000,
+        "query_after_ms": query_after_ms,
         "height": tree_size(n).bit_length(),
     }
 
